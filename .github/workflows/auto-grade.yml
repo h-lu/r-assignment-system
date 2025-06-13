@@ -1,0 +1,136 @@
+name: 自动批改R作业
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'assignments/**/*.R'
+
+jobs:
+  auto-grade:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+    
+    - name: 设置R环境
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: '4.3.0'
+    
+    - name: 安装R包
+      run: |
+        install.packages(c("testthat", "ggplot2", "moments", "lintr"))
+      shell: Rscript {0}
+    
+    - name: 检测修改的作业
+      id: detect-assignment
+      run: |
+        CHANGED_FILES=$(git diff --name-only origin/main...HEAD | grep -E "assignments/.*/assignment\.R$" | head -1)
+        if [ -n "$CHANGED_FILES" ]; then
+          ASSIGNMENT_DIR=$(dirname "$CHANGED_FILES")
+          echo "assignment_dir=$ASSIGNMENT_DIR" >> $GITHUB_OUTPUT
+          echo "发现修改的作业: $ASSIGNMENT_DIR"
+        else
+          echo "没有发现作业文件修改"
+          exit 1
+        fi
+    
+    - name: 运行代码质量检查
+      run: |
+        library(lintr)
+        assignment_file <- "${{ steps.detect-assignment.outputs.assignment_dir }}/assignment.R"
+        if (file.exists(assignment_file)) {
+          lint_results <- lint(assignment_file)
+          if (length(lint_results) > 0) {
+            cat("代码质量问题:\n")
+            print(lint_results)
+          } else {
+            cat("代码质量检查通过!\n")
+          }
+        }
+      shell: Rscript {0}
+      continue-on-error: true
+    
+    - name: 运行自动测试
+      id: run-tests
+      run: |
+        cd "${{ steps.detect-assignment.outputs.assignment_dir }}"
+        Rscript tests.R > test_results.txt 2>&1
+        cat test_results.txt
+        
+        # 提取分数
+        SCORE=$(grep "总分:" test_results.txt | sed 's/.*总分: \([0-9]*\).*/\1/')
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+      continue-on-error: true
+    
+    - name: 生成评分报告
+      run: |
+        SCORE="${{ steps.run-tests.outputs.score }}"
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        STUDENT_NAME="${{ github.event.pull_request.user.login }}"
+        
+        echo "# 📊 作业评分报告" > grade_report.md
+        echo "" >> grade_report.md
+        echo "**学生**: @$STUDENT_NAME" >> grade_report.md
+        echo "**PR编号**: #$PR_NUMBER" >> grade_report.md
+        echo "**作业**: ${{ steps.detect-assignment.outputs.assignment_dir }}" >> grade_report.md
+        echo "**提交时间**: $(date)" >> grade_report.md
+        echo "" >> grade_report.md
+        
+        if [ "$SCORE" -ge 90 ]; then
+          echo "## 🎉 优秀 (${SCORE}/100)" >> grade_report.md
+          echo "恭喜！您的作业完成得非常好！" >> grade_report.md
+        elif [ "$SCORE" -ge 80 ]; then
+          echo "## 👍 良好 (${SCORE}/100)" >> grade_report.md
+          echo "做得不错！还有小的改进空间。" >> grade_report.md
+        elif [ "$SCORE" -ge 60 ]; then
+          echo "## 📝 及格 (${SCORE}/100)" >> grade_report.md
+          echo "基本完成要求，但需要改进。" >> grade_report.md
+        else
+          echo "## ❌ 需要改进 (${SCORE}/100)" >> grade_report.md
+          echo "作业未达到基本要求，请仔细检查代码。" >> grade_report.md
+        fi
+        
+        echo "" >> grade_report.md
+        echo "## 📋 详细测试结果" >> grade_report.md
+        echo "\`\`\`" >> grade_report.md
+        cat "${{ steps.detect-assignment.outputs.assignment_dir }}/test_results.txt" >> grade_report.md
+        echo "\`\`\`" >> grade_report.md
+        
+        cat grade_report.md
+    
+    - name: 评论PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('grade_report.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });
+    
+    - name: 设置PR状态
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const score = parseInt('${{ steps.run-tests.outputs.score }}') || 0;
+          const state = score >= 60 ? 'success' : 'failure';
+          const description = `得分: ${score}/100`;
+          
+          github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.payload.pull_request.head.sha,
+            state: state,
+            target_url: `${context.payload.pull_request.html_url}#issuecomment`,
+            description: description,
+            context: 'auto-grader'
+          });
